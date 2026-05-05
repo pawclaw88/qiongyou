@@ -1,0 +1,4 @@
+{
+  "tests/test_routing.py::TestGeocoder::test_unknown_city_raises": true,
+  "tests/test_routing.py::TestGeocoder::test_unknown_city_returns_none": true
+}

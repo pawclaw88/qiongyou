@@ -1,0 +1,44 @@
+# docker-compose.yml for 窮遊 (qiongyou)
+#
+# Dev (no auth):
+#   docker compose up
+#
+# Production:
+#   QIONGYOU_API_KEYS="key1,key2" \
+#   ORS_API_KEY="your-ors-key" \
+#   docker compose up -d
+#
+# Or use a .env file:
+#   cp .env.example .env
+#   # edit .env
+#   docker compose up -d
+
+version: "3.9"
+
+services:
+  api:
+    build: .
+    image: qiongyou:latest
+    container_name: qiongyou-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      QIONGYOU_API_KEYS: ${QIONGYOU_API_KEYS:-}
+      QIONGYOU_RATE_LIMIT_RPM: ${QIONGYOU_RATE_LIMIT_RPM:-60}
+      QIONGYOU_ALLOWED_ORIGINS: ${QIONGYOU_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:8081}
+      ORS_API_KEY: ${ORS_API_KEY:-}
+      QIONGYOU_LOG_LEVEL: ${QIONGYOU_LOG_LEVEL:-INFO}
+      QIONGYOU_HOST: "0.0.0.0"
+      QIONGYOU_PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M

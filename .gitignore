@@ -1,0 +1,11 @@
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Environment files (if they contain secrets)
+.envvenv/ 
+__pycache__/ 
+*.pyc 
+.env 
+.env    # if not already there

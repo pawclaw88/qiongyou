@@ -1,0 +1,46 @@
+{
+  "module_name": "routing_engine",
+  "purpose": "Greedy insertion trip planner. Takes a validated TravelInput and returns a TravelOutput with the cheapest feasible route connecting origin → stops → origin, within the budget. Uses reward/added_cost ratio (effectively min-cost per greedy step). Populates route, summary, budget_expansion, and diff (None for fresh plans). Called after validator.validate() passes.",
+  "file_path": "/mnt/c/Users/claudbox888/Desktop/qiongyou/routing_engine.py",
+  "dependencies": ["/mnt/c/Users/claudbox888/Desktop/qiongyou/shared_schemas.py"],
+  "input_schema": {
+    "type": "TravelInput",
+    "required_prevalidated": "Yes — caller MUST call validator.validate() first and check status==SUCCESS before calling plan()"
+  },
+  "output_schema": {
+    "type": "TravelOutput",
+    "success": {
+      "status": "Status.SUCCESS",
+      "error_code": "ErrorCode.OK",
+      "route": "list[Segment] — ordered legs: origin→stop[0], stop[0]→stop[1], ..., stop[N]→origin",
+      "stops": "list[Stop] — passed through unchanged from input",
+      "summary": {
+        "total_cost": "float — sum of all segment costs",
+        "total_duration_minutes": "int — sum of all segment durations",
+        "total_distance_km": "float — sum of haversine distances",
+        "total_carbon_kg": "float — sum of segment carbon emissions",
+        "segment_count": "int",
+        "budget_used_pct": "float — total_cost / budget * 100",
+        "currency": "str — echoed from input"
+      },
+      "budget_expansion": "dict — {seg_XX_origin_dest: cost} for each segment",
+      "diff": null
+    },
+    "partial": {
+      "status": "Status.PARTIAL",
+      "error_code": "ErrorCode.INVALID_BUDGET",
+      "error_message": "Route cost N exceeds budget B",
+      "route": "list[Segment] — segments built before budget was exceeded",
+      "summary": "includes warning: BUDGET_EXCEEDED"
+    },
+    "failed": {
+      "status": "Status.FAILED",
+      "error_code": "ErrorCode.NO_ROUTE",
+      "route": "[]"
+    }
+  },
+  "update_method": {
+    "description": "Incremental update — given an existing base TravelOutput and new TravelInput, computes Diff (added_segments, removed_segments, cost_delta, time_delta_minutes, reason) without a full replan"
+  },
+  "pseudocode": "# routing_engine.py\n\n# ── Constants ────────────────────────────────────────────────\n# CARBON_PER_KM — kg CO2 / passenger-km per TransportMode (from shared_schemas)\n# _COST_MATRIX — precomputed (from_city, to_city, mode) → (cost_cny, duration_min, dist_km)\n# _CITY_COORDS — city → (lat, lng) for haversine fallback\n# _MODE_RATE — mode → (CNY/km, min/km) fallback when matrix miss\n\n# ── _best_segment ────────────────────────────────────────────\ndef _best_segment(from_city, from_lat, from_lng,\n                  to_city, to_lat, to_lng,\n                  modes, pref, day) -> Segment:\n    # For each allowed mode:\n    #   cost, dur, dist = _lookup(from_city, to_city, mode)\n    #   carbon = dist * CARBON_PER_KM[mode]\n    #   score  = _score(cost, dur, dist, pref)  # lower = better\n    #   candidates.append(Segment(...))\n    # Return best candidate by preference:\n    #   TIME   → min by duration_minutes\n    #   SCENIC → max by score (most walk-friendly)\n    #   COST   → min by cost\n\n# ── _lookup ───────────────────────────────────────────────────\ndef _lookup(from_city, to_city, mode):\n    # 1. Check _COST_MATRIX\n    # 2. Fallback: haversine(from_city_coords, to_city_coords)\n    #    then cost = dist * rate_per_km; dur = dist * min_per_km\n\n# ── RoutingEngine.plan() ──────────────────────────────────────\ndef plan(self, inp: TravelInput) -> TravelOutput:\n    route = []\n    seg_cost = 0.0\n    seg_time = 0\n    prev_city, prev_lat, prev_lng = origin\n\n    # origin → stops[0]\n    seg = _best_segment(origin, stops[0], modes, pref, arrival_date)\n    route.append(seg); seg_cost += seg.cost; seg_time += seg.duration_minutes\n    update prev to stops[0]\n\n    # stops[i] → stops[i+1]\n    for each adjacent stop pair:\n        seg = _best_segment(a, b, modes, pref, b.arrival_date)\n        if seg_cost + seg.cost > inp.budget:\n            # try walking instead\n            walk_seg = _best_segment(a, b, [WALK], COST, b.arrival_date)\n            if seg_cost + walk_seg.cost <= inp.budget:\n                seg = walk_seg\n            else:\n                return _budget_exceeded(...)\n        route.append(seg); seg_cost += seg.cost\n\n    # final stop → origin (walk only)\n    walk_home = _best_segment(last_stop, origin, [WALK], COST, end_date)\n    if seg_cost + walk_home.cost <= inp.budget:\n        route.append(walk_home)\n\n    # build summary + budget_expansion\n    return TravelOutput(route=route, stops=inp.stops, summary=...,\n                        budget_expansion=..., diff=None,\n                        status=SUCCESS, error_code=OK)\n\n# ── RoutingEngine.update() ────────────────────────────────────\ndef update(self, base: TravelOutput, inp: TravelInput) -> TravelOutput:\n    new_plan = self.plan(inp)\n    added   = segments in new_plan.route not in base.route\n    removed = segments in base.route not in new_plan.route\n    diff = Diff(added, removed,\n                cost_delta=new.total_cost - base.total_cost,\n                time_delta=new.time - base.time,\n                reason=ADDED_STOP)\n    return replace(new_plan, diff=diff)"
+}

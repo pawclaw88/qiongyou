@@ -1,0 +1,117 @@
+{
+  "module_name": "api_handler",
+  "purpose": "Stateless HTTP REST API handler. Exposes POST /plan, POST /update, and GET /health endpoints. Parses JSON request bodies into TravelInput, delegates to validator then routing_engine, and returns the TravelOutput as a JSON HTTP response. Designed for direct consumption by the React Native useTravelPlanner hook with no transformation layer.",
+  "file_path": "/mnt/c/Users/claudbox888/Desktop/qiongyou/api_handler.py",
+  "dependencies": [
+    "/mnt/c/Users/claudbox888/Desktop/qiongyou/shared_schemas.py",
+    "/mnt/c/Users/claudbox888/Desktop/qiongyou/validator.py",
+    "/mnt/c/Users/claudbox888/Desktop/qiongyou/routing_engine.py"
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/health",
+      "description": "Liveness probe — returns {status: 'ok', service: 'qiongyou-api'}",
+      "request_body": null,
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "ok",
+          "service": "qiongyou-api"
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/plan",
+      "description": "Build a new travel plan from scratch",
+      "request_body": {
+        "type": "TravelInput",
+        "example": {
+          "origin_city": "beijing",
+          "origin_lat": 39.9042,
+          "origin_lng": 116.4074,
+          "stops": [
+            {
+              "city": "xian",
+              "lat": 34.3416,
+              "lng": 108.9398,
+              "arrival_date": "2026-06-01",
+              "departure_date": "2026-06-03",
+              "accommodation": "7广聚缘青年旅舍",
+              "notes": "Terracotta Army"
+            },
+            {
+              "city": "chengdu",
+              "lat": 30.5728,
+              "lng": 104.0668,
+              "arrival_date": "2026-06-03",
+              "departure_date": "2026-06-05",
+              "accommodation": null,
+              "notes": "Giant Panda Base"
+            }
+          ],
+          "start_date": "2026-06-01",
+          "end_date": "2026-06-05",
+          "budget": 1500.0,
+          "currency": "CNY",
+          "preference": "cost",
+          "transport_modes": ["walk", "bus", "train", "subway"]
+        }
+      },
+      "response": {
+        "type": "TravelOutput",
+        "success_status": 200,
+        "error_status": 400,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "Access-Control-Allow-Origin": "*"
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/update",
+      "description": "Incrementally update an existing plan with new or changed stops — returns Diff in TravelOutput.diff field",
+      "request_body": {
+        "type": "object",
+        "fields": {
+          "base": {
+            "type": "TravelOutput",
+            "description": "The current/previous plan to diff against"
+          },
+          "input": {
+            "type": "TravelInput",
+            "description": "The new TravelInput (may add/remove/reorder stops)"
+          }
+        }
+      },
+      "response": {
+        "type": "TravelOutput",
+        "success_status": 200,
+        "error_status": 400,
+        "note": "diff field is always non-null on success — contains added_segments, removed_segments, cost_delta, time_delta_minutes, reason"
+      }
+    }
+  ],
+  "input_schema": {
+    "description": "JSON body parsed into TravelInput (POST /plan) or {base: TravelOutput, input: TravelInput} (POST /update)",
+    "content_type": "application/json",
+    "encoding": "UTF-8",
+    "max_body_bytes": "read from Content-Length header"
+  },
+  "output_schema": {
+    "description": "TravelOutput.to_dict() serialised as application/json",
+    "status_code_mapping": {
+      "Status.SUCCESS": 200,
+      "Status.PARTIAL": 400,
+      "Status.FAILED": 400,
+      "unexpected_exception": 500
+    },
+    "headers": {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*"
+    }
+  },
+  "pseudocode": "# api_handler.py\n\n# ── Singleton routing engine ─────────────────────────\n_engine = RoutingEngine()\n\n# ── Route table ────────────────────────────────────\n_ROUTES = {\n    ('GET',  '/health'): _health_handler,\n    ('POST', '/plan'):    _plan_handler,\n    ('POST', '/update'):  _update_handler,\n}\n\n# ── _parse_body ────────────────────────────────────\ndef _parse_body(body: bytes) -> TravelInput | dict:\n    try:\n        d = json.loads(body.decode('utf-8'))\n    except (ValueError, UnicodeDecodeError):\n        return {'error': 'Invalid JSON'}\n    try:\n        return TravelInput.from_dict(d)   # POST /plan\n    except Exception:\n        return d                         # dict for /update\n\n# ── _plan_handler ──────────────────────────────────\ndef _plan_handler(body) -> tuple[dict, int]:\n    parsed = _parse_body(body)\n    if isinstance(parsed, dict) and 'error' in parsed:\n        return parsed, 400\n\n    inp = parsed   # TravelInput\n    vresult = validate(inp)\n    if vresult.status == FAILED:\n        return vresult.to_dict(), 400\n\n    output = _engine.plan(inp)\n    return output.to_dict(), 200\n\n# ── _update_handler ────────────────────────────────\ndef _update_handler(body) -> tuple[dict, int]:\n    d = json.loads(body.decode('utf-8'))\n    base_dict  = d.get('base')\n    input_dict = d.get('input')\n    if not base_dict or not input_dict:\n        return {'error': \"Missing 'base' and/or 'input'\"}, 400\n\n    try:\n        base = TravelOutput.from_dict(base_dict)\n        inp  = TravelInput.from_dict(input_dict)\n    except Exception as e:\n        return {'error': str(e)}, 400\n\n    vresult = validate(inp)\n    if vresult.status == FAILED:\n        return vresult.to_dict(), 400\n\n    updated = _engine.update(base, inp)\n    return updated.to_dict(), 200\n\n# ── HTTPServer bootstrap ────────────────────────────\ndef run(port=8080):\n    server = HTTPServer(('0.0.0.0', port), _RequestHandler)\n    print(f'Listening on http://0.0.0.0:{port}')\n    server.serve_forever()"
+}

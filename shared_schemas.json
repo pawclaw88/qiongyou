@@ -1,0 +1,107 @@
+{
+  "module_name": "shared_schemas",
+  "purpose": "Single source of truth for all data models across validator, routing engine, and API handler. Defines all enums, dataclasses, carbon constants, and serialization methods. No duplicate enum or dataclass definitions anywhere in the codebase.",
+  "file_path": "/mnt/c/Users/claudbox888/Desktop/qiongyou/shared_schemas.py",
+  "dependencies": [],
+  "input_schema": null,
+  "output_schema": {
+    "enums": {
+      "TransportMode": {
+        "values": ["walk", "bus", "train", "subway", "taxi", "ferry"],
+        "description": "Supported transport mode literals. Extends str so serialises to plain strings."
+      },
+      "Currency": {
+        "values": ["CNY","JPY","KRW","USD","EUR","THB","SGD","HKD","TWD","MYR","VND","PHP"],
+        "description": "ISO 4217 currency codes supported by the planner."
+      },
+      "Preference": {
+        "values": ["cost", "time", "scenic"],
+        "description": "User travel-style optimisation target: cheapest, fastest, or most scenic (walk-friendly)."
+      },
+      "ErrorCode": {
+        "values": ["ok","invalid_city","invalid_date","no_route","invalid_budget","unsupported_transport","city_not_found","date_in_past","empty_stops","invalid_preference"],
+        "description": "Machine-readable error codes returned in TravelOutput.error_code."
+      },
+      "Status": {
+        "values": ["success","partial","failed"],
+        "description": "Overall plan status: full success, partial (budget exceeded), or failed."
+      },
+      "UpdateReason": {
+        "values": ["added_stop","removed_stop","mode_changed"],
+        "description": "Why a Diff was produced — drives UI update logic."
+      }
+    },
+    "dataclasses": {
+      "Segment": {
+        "fields": {
+          "transport_mode": "TransportMode — mode used for this leg",
+          "origin": "str — departure city name",
+          "destination": "str — arrival city name",
+          "departure_time": "str — ISO datetime string",
+          "arrival_time": "str — ISO datetime string",
+          "cost": "float — transport cost in currency units",
+          "currency": "Currency — monetary unit",
+          "duration_minutes": "int — leg duration",
+          "distance_km": "float — leg distance in kilometres",
+          "route_name": "str — human-readable route label",
+          "carbon_kg": "float — CO2 emissions for this leg",
+          "score": "float — internal ranking score (lower = better for COST/TIME)"
+        }
+      },
+      "Stop": {
+        "fields": {
+          "city": "str — city name",
+          "lat": "float — latitude",
+          "lng": "float — longitude",
+          "arrival_date": "str — YYYY-MM-DD",
+          "departure_date": "str — YYYY-MM-DD",
+          "accommodation": "str|null — optional hotel/hostel name",
+          "notes": "str|null — optional traveller notes"
+        }
+      },
+      "Diff": {
+        "fields": {
+          "added_segments": "list[Segment] — legs present in new plan but not base",
+          "removed_segments": "list[Segment] — legs present in base but not new plan",
+          "cost_delta": "float — cost difference (new - base)",
+          "time_delta_minutes": "int — duration difference (new - base)",
+          "reason": "UpdateReason — cause of the diff"
+        }
+      },
+      "TravelInput": {
+        "fields": {
+          "origin_city": "str",
+          "origin_lat": "float",
+          "origin_lng": "float",
+          "stops": "list[Stop] — ordered destination stops",
+          "start_date": "str — YYYY-MM-DD",
+          "end_date": "str — YYYY-MM-DD",
+          "budget": "float — maximum transport cost allowed",
+          "currency": "Currency — default CNY",
+          "preference": "Preference — default COST",
+          "transport_modes": "list[TransportMode] — allowed modes; default walk/bus/train/subway"
+        }
+      },
+      "TravelOutput": {
+        "fields": {
+          "route": "list[Segment] — full ordered list of transport legs",
+          "stops": "list[Stop] — enriched stop list with connecting segments",
+          "summary": "dict — total_cost, total_duration_minutes, total_distance_km, total_carbon_kg, segment_count, budget_used_pct, currency",
+          "budget_expansion": "dict — per-segment cost breakdown keyed seg_XX_origin_dest",
+          "diff": "Diff|null — null for fresh plan, populated for incremental updates",
+          "status": "Status",
+          "error_code": "ErrorCode",
+          "error_message": "str|null"
+        }
+      }
+    },
+    "constants": {
+      "CARBON_PER_KM": {
+        "walk": 0.0, "bus": 0.089, "train": 0.041,
+        "subway": 0.037, "taxi": 0.171, "ferry": 0.115,
+        "description": "kg CO2 per passenger-kilometre by transport mode"
+      }
+    }
+  },
+  "pseudocode": "# shared_schemas.py\n# No runtime logic — pure type + data definitions.\n\n# 1. Define enums (all extend str for zero-effort JSON serialisation)\nclass TransportMode(str, Enum): WALK, BUS, TRAIN, SUBWAY, TAXI, FERRY\nclass Currency(str, Enum): CNY, JPY, KRW, ... (12 currencies)\nclass Preference(str, Enum): COST, TIME, SCENIC\nclass ErrorCode(str, Enum): OK, INVALID_CITY, INVALID_DATE, NO_ROUTE, ...\nclass Status(str, Enum): SUCCESS, PARTIAL, FAILED\nclass UpdateReason(str, Enum): ADDED_STOP, REMOVED_STOP, MODE_CHANGED\n\n# 2. Define dataclasses with to_dict / from_dict / to_json methods\n@dataclass Segment: transport_mode, origin, destination, departure_time, arrival_time, cost, currency, duration_minutes, distance_km, route_name, carbon_kg, score\n@dataclass Stop: city, lat, lng, arrival_date, departure_date, accommodation, notes\n@dataclass Diff: added_segments, removed_segments, cost_delta, time_delta_minutes, reason\n@dataclass TravelInput: origin_city, origin_lat, origin_lng, stops, start_date, end_date, budget, currency, preference, transport_modes\n@dataclass TravelOutput: route, stops, summary, budget_expansion, diff, status, error_code, error_message\n\n# 3. Expose CARBON_PER_KM lookup table for routing engine carbon accounting"
+}

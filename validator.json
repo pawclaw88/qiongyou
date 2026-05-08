@@ -1,0 +1,84 @@
+{
+  "module_name": "validator",
+  "purpose": "Stateless input validation for TravelInput. Returns a TravelOutput with status=SUCCESS on valid input, or status=FAILED with a specific ErrorCode and human-readable error_message on any validation failure. Called as the first step of every API request before routing_engine.plan().",
+  "file_path": "/mnt/c/Users/claudbox888/Desktop/qiongyou/validator.py",
+  "dependencies": ["/mnt/c/Users/claudbox888/Desktop/qiongyou/shared_schemas.py"],
+  "input_schema": {
+    "type": "TravelInput",
+    "fields_validated": [
+      {
+        "field": "origin_city",
+        "rule": "non-empty string, must exist in KNOWN_CITIES set (case-insensitive)",
+        "error": "CITY_NOT_FOUND"
+      },
+      {
+        "field": "origin_lat",
+        "rule": "float in [-90, 90]",
+        "error": "INVALID_CITY"
+      },
+      {
+        "field": "origin_lng",
+        "rule": "float in [-180, 180]",
+        "error": "INVALID_CITY"
+      },
+      {
+        "field": "start_date",
+        "rule": "YYYY-MM-DD format, must be >= today",
+        "error": "INVALID_DATE / DATE_IN_PAST"
+      },
+      {
+        "field": "end_date",
+        "rule": "YYYY-MM-DD format, must be > start_date",
+        "error": "INVALID_DATE"
+      },
+      {
+        "field": "budget",
+        "rule": "float > 0",
+        "error": "INVALID_BUDGET"
+      },
+      {
+        "field": "stops",
+        "rule": "non-empty list; each stop.city must be in KNOWN_CITIES; lat/lng in range; arrival_date <= departure_date",
+        "error": "EMPTY_STOPS / CITY_NOT_FOUND / INVALID_DATE"
+      },
+      {
+        "field": "preference",
+        "rule": "must be a Preference enum member",
+        "error": "INVALID_PREFERENCE"
+      },
+      {
+        "field": "transport_modes",
+        "rule": "each element must be a TransportMode enum member",
+        "error": "UNSUPPORTED_TRANSPORT"
+      },
+      {
+        "field": "currency",
+        "rule": "must be a Currency enum member",
+        "error": "INVALID_BUDGET"
+      }
+    ]
+  },
+  "output_schema": {
+    "type": "TravelOutput",
+    "success_case": {
+      "status": "Status.SUCCESS",
+      "error_code": "ErrorCode.OK",
+      "route": "[] (empty — no route built yet)",
+      "stops": "[]",
+      "summary": "{}",
+      "budget_expansion": "{}",
+      "diff": null
+    },
+    "failure_case": {
+      "status": "Status.FAILED",
+      "error_code": "ErrorCode value matching the first failing field",
+      "error_message": "human-readable description of the failure",
+      "route": "[]",
+      "stops": "[]",
+      "summary": "{}",
+      "budget_expansion": "{}",
+      "diff": null
+    }
+  },
+  "pseudocode": "# validator.py\n\n# Load known city name set\nKNOWN_CITIES = {\n  'beijing', 'shanghai', 'guangzhou', ...\n  # 80+ cities across China, Japan, Korea, SE Asia, Taiwan, Europe, Americas, Oceania\n}\n\n# Date regex: YYYY-MM-DD\n_DATE_RE = re.compile(r'^\\d{4}-\\d{2}-\\d{2}$')\n\ndef validate(inp: TravelInput) -> TravelOutput:\n    errors: list[str] = []\n\n    # 1. origin_city non-empty and known\n    if not inp.origin_city or not inp.origin_city.strip():\n        errors.append('origin_city is required')\n    if not city_known(inp.origin_city):\n        return _fail(CITY_NOT_FOUND, f\"Unknown origin city: {inp.origin_city}\")\n\n    # 2. origin coordinates in range\n    if not in_range(inp.origin_lat, (-90, 90)):\n        errors.append(f'origin_lat out of range')\n    if not in_range(inp.origin_lng, (-180, 180)):\n        errors.append(f'origin_lng out of range')\n\n    # 3. parse and validate start_date / end_date\n    start = parse_date(inp.start_date)\n    end   = parse_date(inp.end_date)\n    if start is None:\n        return _fail(INVALID_DATE, 'Invalid start_date format')\n    if end is None:\n        return _fail(INVALID_DATE, 'Invalid end_date format')\n    if end <= start:\n        return _fail(INVALID_DATE, 'end_date must be after start_date')\n    if start < today():\n        return _fail(DATE_IN_PAST, 'start_date is in the past')\n\n    # 4. budget positive\n    if inp.budget <= 0:\n        return _fail(INVALID_BUDGET, 'budget must be positive')\n\n    # 5. at least one stop\n    if not inp.stops:\n        return _fail(EMPTY_STOPS, 'At least one stop is required')\n\n    # 6. validate each stop\n    for i, stop in enumerate(inp.stops):\n        if not stop.city or not stop.city.strip():\n            return _fail(CITY_NOT_FOUND, f'stop[{i}]: city required')\n        if not city_known(stop.city):\n            return _fail(CITY_NOT_FOUND, f'stop[{i}]: Unknown city')\n        if not in_range(stop.lat, (-90,90)):\n            return _fail(INVALID_CITY, f'stop[{i}].lat out of range')\n        if not in_range(stop.lng, (-180,180)):\n            return _fail(INVALID_CITY, f'stop[{i}].lng out of range')\n        arr = parse_date(stop.arrival_date)\n        dep = parse_date(stop.departure_date)\n        if arr is None or dep is None or dep <= arr:\n            return _fail(INVALID_DATE, f'stop[{i}]: invalid dates')\n\n    # 7. preference is Preference enum\n    if not isinstance(inp.preference, Preference):\n        return _fail(INVALID_PREFERENCE, 'Invalid preference')\n\n    # 8. all transport_modes are TransportMode enum\n    for mode in inp.transport_modes:\n        if not isinstance(mode, TransportMode):\n            return _fail(UNSUPPORTED_TRANSPORT, f'Unsupported mode: {mode}')\n\n    # 9. currency is Currency enum\n    if not isinstance(inp.currency, Currency):\n        return _fail(INVALID_BUDGET, 'Unsupported currency')\n\n    # 10. all passed\n    return TravelOutput(\n        status=Status.SUCCESS, error_code=ErrorCode.OK,\n        route=[], stops=[], summary={}, budget_expansion={}, diff=None\n    )\n\ndef _fail(code: ErrorCode, msg: str) -> TravelOutput:\n    return TravelOutput(\n        status=Status.FAILED, error_code=code, error_message=msg,\n        route=[], stops=[], summary={}, budget_expansion={}, diff=None\n    )"
+}

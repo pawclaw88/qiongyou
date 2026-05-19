@@ -14,6 +14,7 @@ ORS enriches segments with route_name and operator; OSRM falls back gracefully.
 
 from __future__ import annotations
 
+import asyncio
 import httpx
 import math
 import os
@@ -95,6 +96,29 @@ class RouteInfo:
 
 # ─── ORS routing ─────────────────────────────────────────────────────────────────
 
+# ─── ORS circuit breaker ──────────────────────────────────────────────────────
+# Tripped after 3 consecutive failures; cools down for 60s then allows one probe.
+# Guards against rate-limiting (429) and auth failures (401) taking down the API.
+
+_ORS_CONSECUTIVE_FAILS = 0
+_ORS_TRIP_TIME: float | None = None   # timestamp when circuit was tripped
+_ORS_COOLDOWN_SEC = 60
+_ORS_MAX_FAILS = 3
+
+
+def _ors_circuit_open() -> bool:
+    global _ORS_CONSECUTIVE_FAILS, _ORS_TRIP_TIME
+    if _ORS_CONSECUTIVE_FAILS < _ORS_MAX_FAILS:
+        return False
+    # Cool down elapsed?
+    if _ORS_TRIP_TIME is not None:
+        import time
+        if time.monotonic() - _ORS_TRIP_TIME >= _ORS_COOLDOWN_SEC:
+            # Allow one probe request; reset below on success/failure
+            return False
+    return True
+
+
 def _ors_profile(mode: str) -> str:
     """Map transport mode to ORS profile."""
     return {
@@ -119,10 +143,16 @@ def _ors_route(
 
     Sets module-level _ors_extra on success so the caller can read route_name/operator.
     """
-    global _ors_extra
+    global _ors_extra, _ORS_CONSECUTIVE_FAILS, _ORS_TRIP_TIME
+
     _ors_extra = {}
 
     if not _ORS_API_KEY:
+        return None
+
+    # Circuit breaker: skip ORS if we've seen too many failures recently
+    if _ors_circuit_open():
+        logger.debug("ORS circuit open — skipping")
         return None
 
     profile = _ors_profile(mode)
@@ -168,17 +198,29 @@ def _ors_route(
 
         _ors_extra = {"route_name": route_name, "operator": operator}
 
+        # Reset failure counter on success
+        _ORS_CONSECUTIVE_FAILS = 0
+        _ORS_TRIP_TIME = None
+
         return RouteInfo(
             distance_km=round(distance_m / 1000, 1),
             duration_minutes=max(1, int(duration_s / 60)),
             cost_cny=0.0,  # filled in by caller
         )
 
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        logger.warning("ORS HTTP %d: %s", code, url)
+        if code in (401, 403, 429):
+            _ORS_CONSECUTIVE_FAILS += 1
+            if _ORS_CONSECUTIVE_FAILS >= _ORS_MAX_FAILS:
+                import time
+                _ORS_TRIP_TIME = time.monotonic()
+                logger.warning("ORS circuit TRIPPED after %d failures", _ORS_CONSECUTIVE_FAILS)
+        return None
     except httpx.TimeoutException:
         logger.warning("ORS timeout: %.4f,%.4f → %.4f,%.4f", lat1, lon1, lat2, lon2)
-        return None
-    except httpx.HTTPStatusError as e:
-        logger.warning("ORS HTTP %d: %s", e.response.status_code, url)
+        _ORS_CONSECUTIVE_FAILS += 1
         return None
     except Exception as e:
         logger.warning("ORS error: %s", e)
@@ -427,3 +469,238 @@ def get_routes_batch(
                                from_lat=from_lat, from_lng=from_lng,
                                to_lat=to_lat,     to_lng=to_lng)
     return results
+
+
+# ─── Async versions for concurrent route pre-fetching ─────────────────────────────────
+
+async def _aors_route(
+    lat1: float, lon1: float,
+    lat2: float, lon2: float,
+    mode: str,
+) -> Optional[RouteInfo]:
+    """
+    Async version of _ors_route — same logic, httpx.AsyncClient.
+    """
+    global _ors_extra, _ORS_CONSECUTIVE_FAILS, _ORS_TRIP_TIME
+
+    _ors_extra = {}
+
+    if not _ORS_API_KEY:
+        return None
+
+    # Circuit breaker
+    if _ors_circuit_open():
+        return None
+
+    profile = _ors_profile(mode)
+    url = f"{_ORS_BASE}/v2/directions/{profile}"
+    params = {
+        "api_key": _ORS_API_KEY,
+        "start": f"{lon1},{lat1}",
+        "end":   f"{lon2},{lat2}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.get(url, params=params, headers={"User-Agent": _USER_AGENT})
+            response.raise_for_status()
+            data = response.json()
+
+        routes = data.get("routes", [])
+        if not routes:
+            return None
+
+        summary = routes[0].get("summary", {})
+        distance_m = summary.get("distance", 0)
+        duration_s = summary.get("duration", 0)
+
+        legs = routes[0].get("legs", [])
+        route_name = ""
+        operator   = ""
+        for leg in legs:
+            for step in leg.get("steps", []):
+                name = step.get("name", "") or step.get("mode", "").lower()
+                if name and not route_name:
+                    route_name = name
+                ops = step.get("operator", "")
+                if ops and not operator:
+                    operator = ops
+        if not route_name:
+            route_name = "OpenRouteService route"
+
+        _ors_extra = {"route_name": route_name, "operator": operator}
+
+        # Reset failure counter on success
+        _ORS_CONSECUTIVE_FAILS = 0
+        _ORS_TRIP_TIME = None
+
+        return RouteInfo(
+            distance_km=round(distance_m / 1000, 1),
+            duration_minutes=max(1, int(duration_s / 60)),
+            cost_cny=0.0,
+        )
+
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        logger.warning("ORS async HTTP %d: %s", code, url)
+        if code in (401, 403, 429):
+            _ORS_CONSECUTIVE_FAILS += 1
+            if _ORS_CONSECUTIVE_FAILS >= _ORS_MAX_FAILS:
+                import time
+                _ORS_TRIP_TIME = time.monotonic()
+                logger.warning("ORS async circuit TRIPPED after %d failures", _ORS_CONSECUTIVE_FAILS)
+        return None
+    except httpx.TimeoutException:
+        logger.warning("ORS async timeout: %.4f,%.4f → %.4f,%.4f", lat1, lon1, lat2, lon2)
+        _ORS_CONSECUTIVE_FAILS += 1
+        return None
+    except Exception as e:
+        logger.warning("ORS async error: %s", e)
+        return None
+
+
+async def _aosrm_route(
+    lat1: float, lon1: float,
+    lat2: float, lon2: float,
+    mode: str,
+) -> Optional[RouteInfo]:
+    """
+    Async version of _osrm_route — same logic, httpx.AsyncClient.
+    """
+    profile = _osrm_profile(mode)
+    url = f"{_OSRM_BASE}/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}"
+    params = {
+        "overview":    "false",
+        "steps":       "false",
+        "annotations": "false",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, params=params, headers={"User-Agent": _USER_AGENT})
+            response.raise_for_status()
+            data = response.json()
+
+        if data.get("code") != "Ok" or not data.get("routes"):
+            return None
+
+        route = data["routes"][0]
+        distance_m = route["distance"]
+        duration_s = route["duration"]
+
+        return RouteInfo(
+            distance_km=round(distance_m / 1000, 1),
+            duration_minutes=max(1, int(duration_s / 60)),
+            cost_cny=0.0,
+        )
+
+    except httpx.TimeoutException:
+        logger.warning("OSRM timeout: %.4f,%.4f → %.4f,%.4f", lat1, lon1, lat2, lon2)
+        return None
+    except httpx.HTTPStatusError as e:
+        logger.warning("OSRM HTTP %d: %s", e.response.status_code, url)
+        return None
+    except Exception as e:
+        logger.warning("OSRM error: %s", e)
+        return None
+
+
+async def aget_route(
+    from_city: str,
+    to_city: str,
+    mode: str,
+    *,
+    from_lat: Optional[float] = None,
+    from_lng: Optional[float] = None,
+    to_lat:   Optional[float] = None,
+    to_lng:   Optional[float] = None,
+) -> Optional[Tuple[float, int, float]]:
+    """
+    Async version of get_route() — returns (cost, duration, distance) or None.
+    """
+    global _ors_extra
+    _ors_extra = {}
+
+    from_lower = from_city.strip().lower()
+    to_lower   = to_city.strip().lower()
+    mode_lower = mode.strip().lower()
+
+    has_coords = (
+        from_lat is not None and from_lng is not None
+        and to_lat   is not None and to_lng   is not None
+    )
+
+    # 1. Hardcoded override matrix
+    key = (from_lower, to_lower, mode_lower)
+    if key in _OVERRIDE_MATRIX:
+        return _OVERRIDE_MATRIX[key]
+
+    # 2. Ferry
+    if mode_lower == "ferry":
+        ferry_key = (from_lower, to_lower)
+        rev_ferry_key = (to_lower, from_lower)
+        if ferry_key in _FERRY_MATRIX:
+            return _FERRY_MATRIX[ferry_key]
+        if rev_ferry_key in _FERRY_MATRIX:
+            cost, dur, dist = _FERRY_MATRIX[rev_ferry_key]
+            return cost, dur, dist
+        if has_coords:
+            return _ferry_heuristic(from_lat, from_lng, to_lat, to_lng)
+        return None
+
+    # 3. Walk
+    if mode_lower == "walk":
+        return _walk_route(from_lat, from_lng, to_lat, to_lng)
+
+    # 4. ORS + OSRM in parallel (if coords available)
+    if has_coords:
+        # Fire ORS and OSRM concurrently
+        ors_task  = _aors_route(from_lat, from_lng, to_lat, to_lng, mode_lower)
+        osrm_task = _aosrm_route(from_lat, from_lng, to_lat, to_lng, mode_lower)
+        ors_result, osrm_result = await asyncio.gather(ors_task, osrm_task, return_exceptions=True)
+
+        ors_info  = ors_result  if isinstance(ors_result,  RouteInfo) else None
+        osrm_info = osrm_result if isinstance(osrm_result, RouteInfo) else None
+
+        if ors_info is not None:
+            cost = _estimate_cost(ors_info.distance_km, mode_lower)
+            _ors_extra = dict(_ors_extra)  # snapshot
+            ors_info.cost_cny = cost
+            return ors_info.as_tuple()
+
+        if osrm_info is not None:
+            cost = _estimate_cost(osrm_info.distance_km, mode_lower)
+            osrm_info.cost_cny = cost
+            return osrm_info.as_tuple()
+
+    # 5. Complete failure
+    logger.warning("No route found: %s → %s by %s", from_city, to_city, mode)
+    return None
+
+
+async def aget_routes_batch(
+    legs: list[Tuple[str, str, str, Optional[Tuple[float, float]], Optional[Tuple[float, float]]]],
+) -> dict[int, Optional[Tuple[float, int, float]]]:
+    """
+    Fully concurrent batch route lookup.
+    Fires all legs in parallel — much faster than sequential get_routes_batch.
+    """
+    async def fetch(
+        i: int,
+        from_c: str, to_c: str, mode: str,
+        from_coords: Optional[Tuple[float, float]],
+        to_coords:   Optional[Tuple[float, float]],
+    ) -> tuple[int, Optional[Tuple[float, int, float]]]:
+        from_lat, from_lng = from_coords if from_coords else (None, None)
+        to_lat,   to_lng   = to_coords   if to_coords   else (None, None)
+        result = await aget_route(from_c, to_c, mode,
+                                  from_lat=from_lat, from_lng=from_lng,
+                                  to_lat=to_lat,     to_lng=to_lng)
+        return i, result
+
+    tasks = [
+        fetch(i, from_c, to_c, mode, from_coords, to_coords)
+        for i, (from_c, to_c, mode, from_coords, to_coords) in enumerate(legs)
+    ]
+    results_list = await asyncio.gather(*tasks)
+    return dict(results_list)

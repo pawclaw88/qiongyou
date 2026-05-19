@@ -450,28 +450,39 @@ def get_ors_extra() -> dict:
 
 
 # ─── Batch helper ───────────────────────────────────────────────────────────────
+# Semaphore limits concurrent OSRM/ORS requests to avoid rate-limiting.
+# 364 legs × 2 services = 728 concurrent sockets → cap at 20 at a time.
+_SEMAPHORE = asyncio.Semaphore(20)
 
-def get_routes_batch(
+async def aget_routes_batch(
     legs: list[Tuple[str, str, str, Optional[Tuple[float, float]], Optional[Tuple[float, float]]]],
 ) -> dict[int, Optional[Tuple[float, int, float]]]:
     """
-    Bulk route lookup. ``legs`` is a list of:
-      (from_city, to_city, mode, (from_lat, from_lng), (to_lat, to_lng))
-
-    Returns ``{leg_index: result_or_None}``.
-    Caller is responsible for managing OSRM/ORS rate limits.
+    Fully concurrent batch route lookup with concurrency cap.
+    Fires all legs in parallel under a semaphore — much faster than sequential
+    get_routes_batch, but won't overwhelm OSRM/ORS with 700+ simultaneous requests.
     """
-    results = {}
-    for i, (from_c, to_c, mode, from_coords, to_coords) in enumerate(legs):
-        from_lat, from_lng = from_coords if from_coords else (None, None)
-        to_lat,   to_lng   = to_coords   if to_coords   else (None, None)
-        results[i] = get_route(from_c, to_c, mode,
-                               from_lat=from_lat, from_lng=from_lng,
-                               to_lat=to_lat,     to_lng=to_lng)
-    return results
+    async def fetch(
+        i: int,
+        from_c: str, to_c: str, mode: str,
+        from_coords: Optional[Tuple[float, float]],
+        to_coords:   Optional[Tuple[float, float]],
+    ) -> tuple[int, Optional[Tuple[float, int, float]]]:
+        async with _SEMAPHORE:
+            from_lat, from_lng = from_coords if from_coords else (None, None)
+            to_lat,   to_lng   = to_coords   if to_coords   else (None, None)
+            result = await aget_route(from_c, to_c, mode,
+                                      from_lat=from_lat, from_lng=from_lng,
+                                      to_lat=to_lat,     to_lng=to_lng)
+            return i, result
 
+    tasks = [
+        fetch(i, from_c, to_c, mode, from_coords, to_coords)
+        for i, (from_c, to_c, mode, from_coords, to_coords) in enumerate(legs)
+    ]
+    results_list = await asyncio.gather(*tasks)
+    return dict(results_list)
 
-# ─── Async versions for concurrent route pre-fetching ─────────────────────────────────
 
 async def _aors_route(
     lat1: float, lon1: float,

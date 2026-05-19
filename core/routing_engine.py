@@ -22,10 +22,13 @@ No luxury upgrades. Food/housing/events never count against budget.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime, timedelta, date
+
+logger = logging.getLogger("qiongyou")
 
 from core.currency import convert, to_cny
 from core.geocoder import city_currency, geocode, generate_candidates
@@ -432,7 +435,12 @@ class RoutingEngine:
         modes = inp.transport_modes or [TransportMode.TRAIN]
         day = inp.start_date or datetime.today().isoformat()
 
-        # ── 5. Batch pre-fetch all route costs before greedy insertion ─────────────
+        # ── 5. Separate locked vs auto-candidate stops ──────────────────────────
+        locked_stops = [c for c in candidates if getattr(c, "locked", False)]
+        auto_candidates = [c for c in candidates if not getattr(c, "locked", False)]
+        auto_candidates_sorted = sorted(auto_candidates, key=lambda s: getattr(s, "popularity", 0) or 0, reverse=True)
+
+        # ── 6. Batch pre-fetch all route costs before greedy insertion ─────────────
         #
         # Build the complete directed graph of all legs we might need:
         #   O→each candidate, each candidate→D, candidate→candidate pairs.
@@ -474,11 +482,22 @@ class RoutingEngine:
                     _batch_legs.append((c_i.city, c_j.city, m.value, cc_i, cc_j))
                     _batch_legs.append((c_j.city, c_i.city, m.value, cc_j, cc_i))
 
-        # Pre-fetch all at once — this is the ONE expensive I/O operation
-        logger.info("Pre-fetching %d route legs concurrently", len(_batch_legs))
+        # Pre-fetch all at once — this is the ONE expensive I/O operation.
+        # Use asyncio.wait_for as a safety net: if all 364 legs don't complete
+        # in 60 s, abandon and fall back to on-demand (no network = fast enough
+        # for the few legs the greedy loop will actually try).
+        logger.info("Pre-fetching %d route legs (semaphore-capped, 60s timeout)", len(_batch_legs))
         _raw_results: dict[int, tuple[float, int, float] | None] = {}
         if _batch_legs:
-            _raw_results = await aget_routes_batch(_batch_legs)
+            try:
+                _raw_results = await asyncio.wait_for(
+                    aget_routes_batch(_batch_legs),
+                    timeout=60.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Route pre-fetch timed out after 60 s — falling back to on-demand")
+            except Exception as e:
+                logger.warning("Route pre-fetch error: %s — falling back to on-demand", e)
 
         # Build a cache: (from_city_lower, to_city_lower, mode) → (cost, dur, dist)
         _route_cache: dict[tuple[str, str, str], tuple[float, int, float]] = {}
@@ -490,7 +509,7 @@ class RoutingEngine:
 
         logger.info("Route cache populated: %d entries", len(_route_cache))
 
-        # ── 6. Greedy insertion (now reads from cache — no I/O) ─────────────────
+        # ── 7. Greedy insertion (now reads from cache — no I/O) ─────────────────
 
         async def aroute_cost_from_cache(
             ordered_stops: list[Stop],
@@ -521,12 +540,18 @@ class RoutingEngine:
                             best = m, c_cost, c_dur, c_dist
 
                 if best is None:
-                    # Fallback: haversine estimate (never blocks on network)
-                    haversine = _haversine_estimate(prev_lat, prev_lng, slat, slng, modes[0])
-                    if haversine is None:
+                    # Cache miss: fall back to async on-demand lookup.
+                    # This still runs ORS+OSRM in parallel per leg (not batch-prefetched
+                    # but not sequential either). Avoids returning an invalid route.
+                    seg = await _acheapest_segment(prev_city, prev_lat, prev_lng,
+                                                    stop.city, slat, slng, modes, day)
+                    if seg is None:
                         return float("inf"), []
-                    c_cost, c_dur, c_dist = haversine
-                    best = modes[0], c_cost, c_dur, c_dist
+                    segs.append(seg)
+                    cost += seg.cost
+                    prev_city = stop.city
+                    prev_lat, prev_lng = slat, slng
+                    continue
 
                 m, c_cost, c_dur, c_dist = best
 
@@ -571,11 +596,6 @@ class RoutingEngine:
             return cost, segs
 
         # Pre-populate selected with locked stops (always included, user manually added)
-        # Locked stops were excluded from batch pre-fetch; look them up directly.
-        locked_stops = [c for c in candidates if getattr(c, "locked", False)]
-        auto_candidates = [c for c in candidates if not getattr(c, "locked", False)]
-        auto_candidates_sorted = sorted(auto_candidates, key=lambda s: getattr(s, "popularity", 0) or 0, reverse=True)
-
         selected: list[Stop] = reorder_by_distance(locked_stops, origin_lat, origin_lng, coord_map)
 
         # For locked stops, use _acheapest_segment directly (user-added, few in number)
